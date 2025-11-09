@@ -1,0 +1,7 @@
+mcp[cli]
+elasticsearch>=7.17.0,<8.0.0
+jsonschema
+openai
+langchain-openai
+pydantic
+python-dotenv

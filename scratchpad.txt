@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "elastic-search": {
+      "command": "/path/to/venv/bin/python",
+      "args": ["-u", "/path/to/your/server.py"]
+    }
+  }
+}

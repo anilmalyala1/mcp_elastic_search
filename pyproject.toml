@@ -1,0 +1,14 @@
+[project]
+name = "mcp-elastic-search"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "mcp[cli]",
+    "elasticsearch>=7.17.0,<8.0.0",
+    "openai",
+    "langchain-openai",
+    "pydantic",
+    "python-dotenv"
+]

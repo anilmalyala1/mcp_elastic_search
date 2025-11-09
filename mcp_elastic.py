@@ -11,11 +11,13 @@ from jsonschema import Draft7Validator, ValidationError
 
 from es_client import create_elasticsearch_client
 from llm_provider import PlannerLLMClient
+from dotenv import load_dotenv,find_dotenv
+from mcp.server.fastmcp import FastMCP as MCPServer
+load_dotenv(find_dotenv())
 
-try:
-    from fastmcp import FastMCPServer as MCPServer
-except ImportError:  # pragma: no cover - fallback when FastMCP is unavailable
-    from mcp.server import Server as MCPServer
+
+
+
 
 # -----------------------------------------------------------------------------
 # Configuration loading
@@ -23,7 +25,7 @@ except ImportError:  # pragma: no cover - fallback when FastMCP is unavailable
 
 ES_URL = os.getenv("ES_URL", "http://localhost:9200")
 ES_API_KEY = os.getenv("ES_API_KEY")
-ENABLE_PLANNER = os.getenv("ENABLE_PLANNER", "false").strip().lower() == "true"
+ENABLE_PLANNER = os.getenv("ENABLE_PLANNER", "true").strip().lower() == "true"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_TIME_FIELD = os.getenv("DEFAULT_TIME_FIELD", "@timestamp")
 SEARCH_SIZE_LIMIT = int(os.getenv("SEARCH_SIZE_LIMIT", "200"))
@@ -725,4 +727,5 @@ def log_startup() -> None:
 
 if __name__ == "__main__":
     log_startup()
-    server.run()
+    #server.run(transport="streamable-http")
+    server.run(transport="stdio")
