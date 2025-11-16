@@ -13,7 +13,21 @@ from es_client import create_elasticsearch_client
 from llm_provider import PlannerLLMClient
 from dotenv import load_dotenv,find_dotenv
 from mcp.server.fastmcp import FastMCP as MCPServer
+import logging
+
 load_dotenv(find_dotenv())
+
+
+# -----------------------------------------------------------------------------
+# Logging configuration
+# -----------------------------------------------------------------------------
+# Set default level to DEBUG for development, can be overridden by LOG_LEVEL env var
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "DEBUG").upper(),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 
 
 
@@ -101,6 +115,180 @@ def get_es_client() -> Elasticsearch:
 # Mapping helpers
 # -----------------------------------------------------------------------------
 
+DEFAULT_LOG_FIELDS = {
+    "trace_id": "trace_id",
+    "span_id": "span_id",
+    "message": "log_message",
+    "service": "service_id",
+    "user": "userid",
+    "status": "response_status",
+    "response_time": "response_time",
+    "path": "path",
+    "time": DEFAULT_TIME_FIELD,
+}
+
+
+def discover_log_fields(
+    inventory: List[Dict[str, Any]],
+    overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """Dynamically discover common log fields from inventory."""
+    # Define candidate field names for each role
+    field_candidates = {
+        "service": ["service.name", "service", "app", "service_id"],
+        "user": ["user.id", "user.name", "user", "userid", "customer_id"],
+        "status": [
+            "http.status_code",
+            "response.status_code",
+            "status",
+            "response_status",
+            "status_code",
+        ],
+        "response_time": [
+            "event.duration",
+            "response_time",
+            "duration",
+            "latency",
+            "responsetime",
+        ],
+        "path": ["http.request.path", "url.path", "path", "request_path"],
+        "message": ["message", "log", "log_message", "error.message"],
+        "trace_id": ["trace.id", "trace_id"],
+        "span_id": ["span.id", "span_id"],
+        "time": ["@timestamp", "timestamp", "event.created"],
+    }
+
+    discovered_fields: Dict[str, str] = {}
+    inventory_field_names = {f["name"] for f in inventory}
+
+    for role, candidates in field_candidates.items():
+        # Find first candidate that exists in the inventory
+        for candidate in candidates:
+            if candidate in inventory_field_names:
+                discovered_fields[role] = candidate
+                break
+
+    # Time field is important, ensure it has a default from environment
+    if "time" not in discovered_fields:
+        discovered_fields["time"] = DEFAULT_TIME_FIELD
+
+    # User overrides take precedence
+    if overrides:
+        for key, value in overrides.items():
+            if key in field_candidates and value:
+                discovered_fields[key] = value
+
+    return discovered_fields
+
+
+def discover_fields_with_llm(inventory: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    """Use an LLM to discover field mappings based on semantic roles."""
+
+    planner = get_planner_client()
+    if not planner:
+        return None
+
+    semantic_roles = [
+        "service", "user", "status", "response_time", "path", "message", "trace_id", "span_id", "time"
+    ]
+    
+    field_details = "\n".join(
+        sorted([f"- {f.get('name')} (type: {f.get('type')})" for f in inventory])
+    )
+    
+    system_prompt = (
+        "You are an expert Elasticsearch data analyst. Your task is to map semantic concepts to the most "
+        "appropriate fields from a provided list of Elasticsearch index fields.\n\n"
+        "The semantic concepts are: "
+        f"{', '.join(semantic_roles)}.\n\n"
+        "Analyze the field list below and return a single JSON object where the keys are the concepts "
+        "and the values are the best matching field names from the list. If no suitable field is found for a concept, "
+        "omit it from the JSON object. Your output must be a single, valid JSON object and nothing else.\n\n"
+        "Available fields:\n"
+        f"{field_details}"
+    )
+
+    try:
+        # The planner client is expected to handle the LLM interaction.
+        discovered_fields = planner.plan(system_prompt, {})
+        
+        if not discovered_fields or not isinstance(discovered_fields, dict):
+            return None
+
+        # Validate that the returned fields are valid and expected.
+        inventory_field_names = {f["name"] for f in inventory}
+        final_fields = {
+            role: field_name
+            for role, field_name in discovered_fields.items()
+            if role in semantic_roles and isinstance(field_name, str) and field_name in inventory_field_names
+        }
+            
+        return final_fields if final_fields else None
+
+    except Exception:
+        # Gracefully fail if LLM call or parsing fails.
+        return None
+
+
+def resolve_log_fields(overrides: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Merge user-supplied field overrides with defaults."""
+
+    fields = dict(DEFAULT_LOG_FIELDS)
+    if overrides:
+        for key, value in overrides.items():
+            if key in fields and value:
+                fields[key] = value
+    if not fields.get("time"):
+        fields["time"] = DEFAULT_TIME_FIELD
+    return fields
+
+
+def get_by_dotted_path(source: Dict[str, Any], path: Optional[str]) -> Any:
+    """Return a nested field from _source using dotted notation."""
+
+    if not path:
+        return None
+    parts = path.split(".")
+    current: Any = source
+    for part in parts:
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            return None
+    return current
+
+
+def find_field_info(field_name: Optional[str], inventory: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Locate metadata about a field from the flattened mappings."""
+
+    if not field_name:
+        return None
+    return next((f for f in inventory if f.get("name") == field_name), None)
+
+
+def ensure_terms_field(field_name: Optional[str], inventory: List[Dict[str, Any]]) -> Optional[str]:
+    """Return a field suitable for terms aggregations, falling back to .keyword when available."""
+
+    if not field_name:
+        return None
+    if field_name.endswith(".keyword"):
+        return field_name
+    info = find_field_info(field_name, inventory)
+    if info and info.get("hasKeyword") and info.get("type") != "keyword":
+        return f"{field_name}.keyword"
+    return field_name
+
+
+def strip_keyword_suffix(field_name: Optional[str]) -> Optional[str]:
+    """Trim trailing .keyword so _source lookups work as expected."""
+
+    if not field_name:
+        return None
+    if field_name.endswith(".keyword"):
+        return field_name[: -len(".keyword")]
+    return field_name
+# -----------------------------------------------------------------------------
+
 
 def is_numeric_type(field_type: Optional[str]) -> bool:
     """Return True if the mapping type is numeric."""
@@ -166,6 +354,65 @@ def flatten_mappings(mapping: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 # -----------------------------------------------------------------------------
 # Field capabilities helper
+# -----------------------------------------------------------------------------
+
+
+def normalize_indices_param(index: Union[str, List[str]]) -> List[str]:
+    """Normalize index parameter into a non-empty list when possible."""
+
+    if isinstance(index, str):
+        indices = [index]
+    else:
+        indices = list(index)
+    return [name for name in indices if name]
+
+
+def parse_terms_buckets(buckets: List[Dict[str, Any]], value_key: str = "key") -> List[Dict[str, Any]]:
+    """Convert Elasticsearch terms buckets into compact summaries."""
+
+    parsed: List[Dict[str, Any]] = []
+    for bucket in buckets:
+        parsed.append(
+            {
+                "value": bucket.get(value_key),
+                "count": bucket.get("doc_count", 0),
+            }
+        )
+    return parsed
+
+
+def build_log_sample(source: Dict[str, Any], fields: Dict[str, str]) -> Dict[str, Any]:
+    """Extract representative log fields from a hit source."""
+
+    sample: Dict[str, Any] = {}
+    for label, field_key in [
+        ("trace_id", "trace_id"),
+        ("span_id", "span_id"),
+        ("service", "service"),
+        ("user", "user"),
+        ("status", "status"),
+        ("response_time", "response_time"),
+        ("path", "path"),
+    ]:
+        field_name = strip_keyword_suffix(fields.get(field_key))
+        value = get_by_dotted_path(source, field_name)
+        if value is not None:
+            sample[label] = value
+
+    message_field = strip_keyword_suffix(fields.get("message"))
+    message_value = get_by_dotted_path(source, message_field)
+    if isinstance(message_value, str):
+        sample["message"] = message_value[:500]
+    elif message_value is not None:
+        sample["message"] = message_value
+    return sample
+
+
+def field_is_numeric(field_name: Optional[str], inventory: List[Dict[str, Any]]) -> bool:
+    """Return True when the field is mapped as numeric."""
+
+    info = find_field_info(field_name, inventory)
+    return bool(info and info.get("isNumeric"))
 # -----------------------------------------------------------------------------
 
 
@@ -531,9 +778,506 @@ def plan_query_internal(
 # -----------------------------------------------------------------------------
 
 
+def build_time_filters(lookback: Optional[str], time_field: str) -> List[Dict[str, Any]]:
+    """Create range filters for the requested lookback window."""
+
+    if not lookback:
+        return []
+    return [{"range": {time_field: {"gte": lookback, "lte": "now"}}}]
+
+
+def extract_field_inventory_for_indices(index: Union[str, List[str]]) -> List[Dict[str, Any]]:
+    """Return mapping inventory for the first index in the list."""
+
+    indices = normalize_indices_param(index)
+    if not indices:
+        return []
+    return extract_field_inventory(indices)
+
+
+@server.tool()
+def summarize_logs(
+    index: Union[str, List[str]],
+    lookback: str = "now-24h",
+    field_overrides: Optional[Dict[str, str]] = None,
+    include_samples: bool = True,
+) -> Dict[str, Any]:
+    """Generates a high-level summary of log data from specified indices.
+
+    This tool automatically discovers common log fields (like service, status, response time)
+    and computes key metrics such as total log count, status code distribution, error rates,
+    top users/services, and slowest API paths. It's ideal for getting a quick overview
+    of log activity over a given time period.
+
+    Args:
+        index: Name of the index or a list of index names/patterns to search
+            (e.g., "logs-*" or ["logs-prod", "logs-dev"]).
+        lookback: The time window to analyze. Uses Elasticsearch date math
+            (e.g., "now-24h", "now-7d"). Defaults to "now-24h".
+        field_overrides: Optional dictionary to manually specify field names for
+            roles like 'service', 'status', 'user', etc., if auto-discovery is
+            insufficient.
+        include_samples: If True, includes a small number of recent log entries
+            in the summary. Defaults to True.
+    """
+
+    logger.debug(f"summarize_logs called with index={index}, lookback={lookback}, include_samples={include_samples}")
+
+    indices = normalize_indices_param(index)
+    if not indices:
+        logger.warning("No indices provided, returning error.")
+        return {"error": "index must be provided."}
+
+    client = get_es_client()
+    inventory = extract_field_inventory_for_indices(indices)
+    logger.debug(f"Inventory contains {len(inventory)} fields.")
+
+    fields = None
+    # Try LLM-powered discovery first
+    if ENABLE_PLANNER:
+        logger.debug("ENABLE_PLANNER is True. Attempting LLM-powered field discovery.")
+        fields = discover_fields_with_llm(inventory)
+        if fields:
+            logger.debug(f"LLM-powered discovery successful. Fields: {fields}")
+        else:
+            logger.debug("LLM-powered discovery failed or returned no fields.")
+
+    # Fallback to heuristic-based discovery if LLM fails or is disabled
+    if not fields:
+        logger.debug("Falling back to heuristic field discovery.")
+        fields = discover_log_fields(inventory)
+        logger.debug(f"Heuristic discovery fields: {fields}")
+
+    # Apply user overrides as the final step
+    if field_overrides:
+        logger.debug(f"Applying field overrides: {field_overrides}")
+        fields.update(field_overrides)
+    
+    logger.debug(f"Final resolved fields for aggregations: {fields}")
+
+    service_field = ensure_terms_field(fields.get("service"), inventory)
+    user_field = ensure_terms_field(fields.get("user"), inventory)
+    status_field = fields.get("status")
+    status_terms_field = ensure_terms_field(status_field, inventory)
+    path_field = fields.get("path")
+    path_terms_field = ensure_terms_field(path_field, inventory)
+    response_time_field = fields.get("response_time")
+    response_time_numeric = field_is_numeric(response_time_field, inventory)
+    time_field = fields.get("time", DEFAULT_TIME_FIELD) or DEFAULT_TIME_FIELD
+
+    logger.debug(f"Aggregation fields - service_field={service_field}, user_field={user_field}, status_terms_field={status_terms_field}, path_terms_field={path_terms_field}, response_time_field={response_time_field}, time_field={time_field}")
+
+    query_filters = build_time_filters(lookback, time_field)
+    bool_query: Dict[str, Any] = {"must": [], "filter": query_filters} if query_filters else {"must": [], "filter": []}
+    if not query_filters:
+        bool_query["must"].append({"match_all": {}})
+    logger.debug(f"Query filters: {query_filters}")
+
+    aggs: Dict[str, Any] = {}
+    if status_terms_field:
+        aggs["status_counts"] = {
+            "terms": {
+                "field": status_terms_field,
+                "size": 6,
+                "missing": "UNKNOWN",
+            }
+        }
+        logger.debug(f"Added status_counts aggregation for field: {status_terms_field}")
+
+    if service_field:
+        aggs["top_services"] = {
+            "terms": {
+                "field": service_field,
+                "size": 5,
+                "missing": "unknown_service",
+            }
+        }
+        logger.debug(f"Added top_services aggregation for field: {service_field}")
+
+    if user_field:
+        aggs["top_users"] = {
+            "terms": {
+                "field": user_field,
+                "size": 5,
+                "missing": "anonymous",
+            }
+        }
+        logger.debug(f"Added top_users aggregation for field: {user_field}")
+
+    if response_time_numeric and response_time_field:
+        aggs["response_time_stats"] = {"stats": {"field": response_time_field}}
+        aggs["response_time_percentiles"] = {
+            "percentiles": {
+                "field": response_time_field,
+                "percents": [50, 90, 95, 99],
+            }
+        }
+        logger.debug(f"Added response_time aggregations for field: {response_time_field}")
+
+    if path_terms_field and response_time_field and response_time_numeric:
+        aggs["slow_paths"] = {
+            "terms": {
+                "field": path_terms_field,
+                "size": 5,
+                "order": {"avg_latency": "desc"},
+                "missing": "unknown_path",
+            },
+            "aggs": {
+                "avg_latency": {"avg": {"field": response_time_field}},
+            },
+        }
+        logger.debug(f"Added slow_paths aggregation for field: {path_terms_field}")
+
+    if status_field and field_is_numeric(status_field, inventory):
+        aggs["status_buckets"] = {
+            "filters": {
+                "filters": {
+                    "errors": {"range": {status_field: {"gte": 500}}},
+                    "warnings": {"range": {status_field: {"gte": 400, "lt": 500}}},
+                    "success": {"range": {status_field: {"gte": 200, "lt": 400}}},
+                }
+            }
+        }
+        logger.debug(f"Added status_buckets aggregation for field: {status_field}")
+
+    body: Dict[str, Any] = {
+        "size": 3 if include_samples else 0,
+        "query": {"bool": bool_query},
+        "aggs": aggs,
+        "timeout": f"{SEARCH_TIMEOUT_MS}ms",
+        "track_total_hits": True,
+    }
+
+    if include_samples:
+        body["sort"] = [{time_field: {"order": "desc"}}]
+        logger.debug(f"Added sort for samples on field: {time_field}")
+
+    logger.debug(f"Elasticsearch search body: {json.dumps(body, indent=2)}")
+
+    try:
+        response = client.search(index=indices, body=body)
+        logger.debug(f"Elasticsearch search successful. Took: {response.get('took')}ms")
+        # Print a truncated version of the response to avoid excessive output
+        logger.debug(f"Elasticsearch response (truncated, first 1000 chars): {json.dumps(response, indent=2)[:1000]}...")
+    except es_exceptions.ElasticsearchException as exc:
+        logger.error(f"Elasticsearch search failed: {exc}", exc_info=True)
+        return {"error": f"Failed to summarize logs: {exc}"}
+
+    hits_section = response.get("hits", {}) or {}
+    total_value = hits_section.get("total")
+    if isinstance(total_value, dict):
+        total_count = total_value.get("value", 0)
+    elif isinstance(total_value, int):
+        total_count = total_value
+    else:
+        total_count = 0
+    logger.debug(f"Total count from hits_section: {total_count}")
+
+    aggregations = response.get("aggregations") or {}
+    logger.debug(f"Aggregations section received: {list(aggregations.keys()) if aggregations else 'None'}")
+
+    status_counts = parse_terms_buckets(
+        aggregations.get("status_counts", {}).get("buckets", [])
+    ) if "status_counts" in aggregations else []
+    logger.debug(f"Status counts: {status_counts}")
+
+    status_buckets = aggregations.get("status_buckets", {}).get("buckets", {})
+    errors = status_buckets.get("errors", {}).get("doc_count", 0)
+    warnings = status_buckets.get("warnings", {}).get("doc_count", 0)
+    success = status_buckets.get("success", {}).get("doc_count", 0)
+    error_rate = (errors / total_count) if (total_count and status_buckets) else 0.0
+    logger.debug(f"Status buckets - errors={errors}, warnings={warnings}, success={success}, error_rate={error_rate}")
+
+    top_services = parse_terms_buckets(
+        aggregations.get("top_services", {}).get("buckets", [])
+    ) if "top_services" in aggregations else []
+    logger.debug(f"Top services: {top_services}")
+
+    top_users = parse_terms_buckets(
+        aggregations.get("top_users", {}).get("buckets", [])
+    ) if "top_users" in aggregations else []
+    logger.debug(f"Top users: {top_users}")
+
+    slow_paths: List[Dict[str, Any]] = []
+    if "slow_paths" in aggregations:
+        for bucket in aggregations["slow_paths"].get("buckets", []):
+            slow_paths.append(
+                {
+                    "path": bucket.get("key"),
+                    "count": bucket.get("doc_count", 0),
+                    "avg_response_time": bucket.get("avg_latency", {}).get("value"),
+                }
+            )
+    logger.debug(f"Slow paths: {slow_paths}")
+
+    samples: List[Dict[str, Any]] = []
+    if include_samples:
+        for hit in hits_section.get("hits", []):
+            source = hit.get("_source") or {}
+            if isinstance(source, dict):
+                samples.append(build_log_sample(source, fields))
+    logger.debug(f"Number of samples generated: {len(samples)}")
+
+    status_summary: Dict[str, Any] = {"distribution": status_counts}
+    if status_buckets:
+        status_summary["groups"] = {
+            "errors": errors,
+            "warnings": warnings,
+            "success": success,
+            "error_rate": round(error_rate, 4),
+        }
+
+    result: Dict[str, Any] = {
+        "total": total_count,
+        "time_window": {"gte": lookback, "lte": "now"} if lookback else None,
+        "status": status_summary,
+        "services": top_services,
+        "users": top_users,
+        "slow_paths": slow_paths,
+    }
+
+    if response_time_numeric and response_time_field:
+        stats = aggregations.get("response_time_stats", {})
+        percentiles = aggregations.get("response_time_percentiles", {}).get("values", {})
+        result["response_time"] = {
+            "avg": stats.get("avg"),
+            "min": stats.get("min"),
+            "max": stats.get("max"),
+            "p50": percentiles.get("50.0"),
+            "p90": percentiles.get("90.0"),
+            "p95": percentiles.get("95.0"),
+            "p99": percentiles.get("99.0"),
+        }
+        logger.debug(f"Response time stats added: {result.get('response_time')}")
+
+    if samples:
+        result["samples"] = samples
+        logger.debug("Samples added to result.")
+
+    logger.debug(f"Final result keys: {list(result.keys())}")
+    return result
+
+
+@server.tool()
+def log_trend(
+    index: Union[str, List[str]],
+    lookback: str = "now-24h",
+    interval: str = "1h",
+    field_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Analyzes log data over time to provide trend information.
+
+    This tool buckets logs by a specified time interval and calculates metrics for each
+    bucket, such as the total count, status code distribution, and average response time.
+    It is useful for understanding patterns, spotting spikes in errors, or tracking
+    performance changes.
+
+    Args:
+        index: Name of the index or a list of index names/patterns to search.
+        lookback: The total time window to analyze (e.g., "now-24h").
+            Defaults to "now-24h".
+        interval: The duration of each time bucket for the trend analysis
+            (e.g., "1h", "15m", "1d"). Defaults to "1h".
+        field_overrides: Optional dictionary to manually specify field names for
+            'time', 'status', and 'response_time'.
+    """
+
+    indices = normalize_indices_param(index)
+    if not indices:
+        return {"error": "index must be provided."}
+
+    client = get_es_client()
+    fields = resolve_log_fields(field_overrides)
+    inventory = extract_field_inventory_for_indices(indices)
+
+    time_field = fields.get("time", DEFAULT_TIME_FIELD) or DEFAULT_TIME_FIELD
+    status_field = ensure_terms_field(fields.get("status"), inventory)
+    response_time_field = fields.get("response_time")
+    response_time_numeric = field_is_numeric(response_time_field, inventory)
+
+    aggs: Dict[str, Any] = {
+        "by_interval": {
+            "date_histogram": {
+                "field": time_field,
+                "fixed_interval": interval,
+                "format": "strict_date_optional_time",
+                "min_doc_count": 0,
+            },
+            "aggs": {},
+        }
+    }
+
+    if status_field:
+        aggs["by_interval"]["aggs"]["status_counts"] = {
+            "terms": {
+                "field": status_field,
+                "size": 5,
+                "missing": "UNKNOWN",
+            }
+        }
+
+    if response_time_field and response_time_numeric:
+        aggs["by_interval"]["aggs"]["avg_response_time"] = {
+            "avg": {"field": response_time_field}
+        }
+
+    body = {
+        "size": 0,
+        "query": {
+            "bool": {
+                "filter": build_time_filters(lookback, time_field),
+            }
+        },
+        "aggs": aggs,
+        "timeout": f"{SEARCH_TIMEOUT_MS}ms",
+    }
+
+    try:
+        response = client.search(index=indices, body=body)
+    except es_exceptions.ElasticsearchException as exc:
+        return {"error": f"Failed to fetch log trend: {exc}"}
+
+    buckets = (
+        response.get("aggregations", {})
+        .get("by_interval", {})
+        .get("buckets", [])
+    )
+
+    trend: List[Dict[str, Any]] = []
+    for bucket in buckets:
+        entry: Dict[str, Any] = {
+            "interval_start": bucket.get("key_as_string"),
+            "count": bucket.get("doc_count", 0),
+        }
+        status_aggs = bucket.get("status_counts", {})
+        if status_aggs:
+            entry["status_distribution"] = parse_terms_buckets(status_aggs.get("buckets", []))
+        avg_latency = bucket.get("avg_response_time", {}).get("value")
+        if avg_latency is not None:
+            entry["avg_response_time"] = avg_latency
+        trend.append(entry)
+
+    return {
+        "time_window": {"gte": lookback, "lte": "now"} if lookback else None,
+        "interval": interval,
+        "buckets": trend,
+    }
+
+
+@server.tool()
+def sample_trace(
+    index: Union[str, List[str]],
+    trace_id: str,
+    size: int = 10,
+    field_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Retrieves log events associated with a specific trace ID.
+
+    This is useful for debugging and following the lifecycle of a single request as it
+    propagates through multiple services. The tool returns a sample of log events for
+    the trace, along with a summary of span counts and status distributions within it.
+
+    Args:
+        index: Name of the index or a list of index names/patterns to search.
+        trace_id: The unique identifier of the trace to retrieve.
+        size: The maximum number of log events to return. Defaults to 10.
+        field_overrides: Optional dictionary to manually specify field names for
+            'trace_id', 'span_id', etc.
+    """
+
+    if not trace_id:
+        return {"error": "trace_id must be provided."}
+
+    indices = normalize_indices_param(index)
+    if not indices:
+        return {"error": "index must be provided."}
+
+    client = get_es_client()
+    fields = resolve_log_fields(field_overrides)
+    inventory = extract_field_inventory_for_indices(indices)
+
+    time_field = fields.get("time", DEFAULT_TIME_FIELD) or DEFAULT_TIME_FIELD
+    trace_source_field = fields.get("trace_id")
+    if not trace_source_field:
+        return {"error": "trace_id field is not configured."}
+
+    trace_field = ensure_terms_field(trace_source_field, inventory) or trace_source_field
+    span_field = ensure_terms_field(fields.get("span_id"), inventory)
+    status_field = ensure_terms_field(fields.get("status"), inventory)
+
+    fetch_size = max(1, min(size, 50))
+    query = {
+        "bool": {
+            "filter": [
+                {"term": {trace_field: {"value": trace_id}}},
+            ]
+        }
+    }
+
+    body: Dict[str, Any] = {
+        "size": fetch_size,
+        "query": query,
+        "sort": [{time_field: {"order": "asc"}}],
+        "timeout": f"{SEARCH_TIMEOUT_MS}ms",
+        "aggs": {},
+        "track_total_hits": True,
+    }
+
+    if span_field:
+        body["aggs"]["span_counts"] = {
+            "terms": {"field": span_field, "size": fetch_size}
+        }
+
+    if status_field:
+        body["aggs"]["status_counts"] = {
+            "terms": {"field": status_field, "size": 5, "missing": "UNKNOWN"}
+        }
+
+    try:
+        response = client.search(index=indices, body=body)
+    except es_exceptions.ElasticsearchException as exc:
+        return {"error": f"Failed to sample trace: {exc}"}
+
+    hits_section = response.get("hits", {}) or {}
+    total_value = hits_section.get("total")
+    if isinstance(total_value, dict):
+        total_count = total_value.get("value", 0)
+    elif isinstance(total_value, int):
+        total_count = total_value
+    else:
+        total_count = 0
+
+    samples: List[Dict[str, Any]] = []
+    for hit in hits_section.get("hits", []):
+        source = hit.get("_source") or {}
+        if isinstance(source, dict):
+            samples.append(build_log_sample(source, fields))
+
+    aggs = response.get("aggregations", {}) or {}
+    span_counts = parse_terms_buckets(aggs.get("span_counts", {}).get("buckets", []))
+    status_counts = parse_terms_buckets(aggs.get("status_counts", {}).get("buckets", []))
+
+    return {
+        "trace_id": trace_id,
+        "total_events": total_count,
+        "span_counts": span_counts,
+        "status_distribution": status_counts,
+        "samples": samples,
+    }
+
+
 @server.tool()
 def list_indices(prefix: str = "") -> Dict[str, Any]:
-    """List indices filtered by optional prefix."""
+    """Lists available Elasticsearch indices, with optional filtering by prefix.
+
+    This tool provides a list of all indices in the cluster, including their document
+    count and storage size. It can be used to discover available data sources before
+    querying.
+
+    Args:
+        prefix: An optional string prefix to filter the list of indices. If provided,
+            only indices whose names start with this prefix are returned. Defaults to "".
+    """
 
     client = get_es_client()
     try:
@@ -564,7 +1308,15 @@ def list_indices(prefix: str = "") -> Dict[str, Any]:
 
 @server.tool()
 def get_mapping(index: str) -> Dict[str, Any]:
-    """Return flattened field information for an index."""
+    """Retrieves the mapping for a specified index.
+
+    The mapping defines the structure and data types of the fields within an index.
+    This tool returns a flattened list of all fields and their properties (e.g., type,
+    isNumeric, isDate), which is essential for constructing accurate queries.
+
+    Args:
+        index: The name of the index for which to retrieve the mapping.
+    """
 
     cache_key = f"mapping:{index}"
     cached = mappings_cache.get(cache_key)
@@ -588,7 +1340,16 @@ def get_mapping(index: str) -> Dict[str, Any]:
 
 @server.tool()
 def get_field_caps(indices: List[str]) -> Dict[str, Any]:
-    """Return field capabilities for the provided indices."""
+    """Retrieves the capabilities of fields across one or more indices.
+
+    Field capabilities describe whether a field is searchable and aggregatable. This is
+    useful for determining which fields can be used in queries and aggregations,
+    especially when dealing with multiple indices that may have different mappings.
+
+    Args:
+        indices: A list of index names or patterns for which to retrieve field
+            capabilities.
+    """
 
     if not indices:
         return {"error": "indices list must not be empty."}
@@ -611,7 +1372,18 @@ def get_field_caps(indices: List[str]) -> Dict[str, Any]:
 
 @server.tool()
 def sample_values(index: str, field: str, size: int = 10) -> Dict[str, Any]:
-    """Return sample values for a field using a terms aggregation."""
+    """Retrieves a sample of unique values for a specific field.
+
+    This tool runs a terms aggregation to find the most common values for a given field.
+    It is useful for understanding the data distribution within a field or for getting
+    example values to use in a query filter.
+
+    Args:
+        index: The name of the index to query.
+        field: The field from which to sample values (e.g., "service_id.keyword").
+            For text fields, use the ".keyword" variant for accurate term aggregation.
+        size: The maximum number of unique sample values to return. Defaults to 10.
+    """
 
     client = get_es_client()
     agg_size = max(1, min(size, 20))
@@ -647,7 +1419,17 @@ def execute_search(
     index: Union[str, List[str]],
     dsl: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Execute an Elasticsearch search after validating the DSL."""
+    """Executes a raw Elasticsearch Query DSL search.
+
+    This tool provides a direct way to query Elasticsearch using its native Domain
+    Specific Language (DSL). It validates the query against a security policy (e.g.,
+    no scripts) and applies safety limits (e.g., on result size) before execution.
+
+    Args:
+        index: Name of the index or a list of index names/patterns to search.
+        dsl: The Elasticsearch Query DSL payload as a dictionary. It can contain
+            'query', 'aggs', 'size', 'from', etc.
+    """
 
     try:
         prepared = validate_and_prepare_dsl(dsl)
@@ -697,7 +1479,19 @@ if ENABLE_PLANNER:
         indices: Optional[List[str]] = None,
         hints: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Plan a query using an LLM (if configured) or heuristics."""
+        """Translates a natural language question into an Elasticsearch Query DSL.
+
+        This tool uses an LLM (if configured) or local heuristics to convert a user's
+        question (e.g., "show me login errors from the last hour") into a valid
+        Elasticsearch DSL query. The result includes the generated DSL, the target
+        indices, and the planner's confidence and assumptions.
+
+        Args:
+            nl: The natural language question to be translated into a query.
+            indices: Optional list of index names to search. If not provided, the
+                planner will attempt to select relevant indices.
+            hints: Optional dictionary of hints to guide the planning process.
+        """
 
         if not nl:
             return {"error": "nl must be provided."}
@@ -713,7 +1507,16 @@ if ENABLE_PLANNER:
 def log_startup() -> None:
     """Log configuration at startup."""
 
-    tools_enabled = ["list_indices", "get_mapping", "get_field_caps", "sample_values", "execute_search"]
+    tools_enabled = [
+        "summarize_logs",
+        "log_trend",
+        "sample_trace",
+        "list_indices",
+        "get_mapping",
+        "get_field_caps",
+        "sample_values",
+        "execute_search",
+    ]
     if ENABLE_PLANNER:
         tools_enabled.append("plan_query")
     print(
@@ -727,5 +1530,5 @@ def log_startup() -> None:
 
 if __name__ == "__main__":
     log_startup()
-    #server.run(transport="streamable-http")
-    server.run(transport="stdio")
+    server.run(transport="streamable-http")
+    #server.run(transport="stdio")
