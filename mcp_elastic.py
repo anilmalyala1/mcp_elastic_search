@@ -801,6 +801,9 @@ def summarize_logs(
     lookback: str = "now-24h",
     field_overrides: Optional[Dict[str, str]] = None,
     include_samples: bool = True,
+    sample_size: int = 3,
+    sample_strategy: str = "recent",
+    max_message_length: int = 500,
 ) -> Dict[str, Any]:
     """Generates a high-level summary of log data from specified indices.
 
@@ -817,8 +820,15 @@ def summarize_logs(
         field_overrides: Optional dictionary to manually specify field names for
             roles like 'service', 'status', 'user', etc., if auto-discovery is
             insufficient.
-        include_samples: If True, includes a small number of recent log entries
-            in the summary. Defaults to True.
+        include_samples: If True, includes log samples in the summary. Defaults to True.
+        sample_size: Number of log samples to include (0-10). Defaults to 3. Set to 0
+            for aggregations-only results with minimal response size.
+        sample_strategy: How to sample logs. Options:
+            - "recent": Most recent logs (default, sorted by time descending)
+            - "random": Random sampling for unbiased representation
+            - "none": No samples, aggregations only (same as sample_size=0)
+        max_message_length: Maximum length for log message fields in samples.
+            Messages longer than this will be truncated. Defaults to 500 characters.
     """
 
     logger.debug(f"summarize_logs called with index={index}, lookback={lookback}, include_samples={include_samples}")
@@ -875,14 +885,21 @@ def summarize_logs(
 
     aggs: Dict[str, Any] = {}
     if status_terms_field:
-        aggs["status_counts"] = {
-            "terms": {
-                "field": status_terms_field,
-                "size": 6,
-                "missing": "UNKNOWN",
-            }
+        # Check if status field is numeric to avoid "UNKNOWN" string error
+        status_is_numeric = field_is_numeric(status_field, inventory)
+        terms_agg = {
+            "field": status_terms_field,
+            "size": 6,
         }
-        logger.debug(f"Added status_counts aggregation for field: {status_terms_field}")
+        # Only add missing value if field is not numeric (string missing values fail on numeric fields)
+        if not status_is_numeric:
+            terms_agg["missing"] = "UNKNOWN"
+        else:
+            # For numeric fields, use -1 to represent unknown/missing status codes
+            terms_agg["missing"] = -1
+
+        aggs["status_counts"] = {"terms": terms_agg}
+        logger.debug(f"Added status_counts aggregation for field: {status_terms_field} (numeric={status_is_numeric})")
 
     if service_field:
         aggs["top_services"] = {
@@ -940,17 +957,36 @@ def summarize_logs(
         }
         logger.debug(f"Added status_buckets aggregation for field: {status_field}")
 
+    # Determine actual sampling behavior
+    actual_sample_size = 0
+    if sample_strategy == "none" or sample_size <= 0:
+        actual_sample_size = 0
+        include_samples = False
+    elif include_samples:
+        actual_sample_size = max(0, min(sample_size, 10))  # Clamp to 0-10
+
     body: Dict[str, Any] = {
-        "size": 3 if include_samples else 0,
+        "size": actual_sample_size,
         "query": {"bool": bool_query},
         "aggs": aggs,
         "timeout": f"{SEARCH_TIMEOUT_MS}ms",
         "track_total_hits": True,
     }
 
-    if include_samples:
-        body["sort"] = [{time_field: {"order": "desc"}}]
-        logger.debug(f"Added sort for samples on field: {time_field}")
+    if actual_sample_size > 0:
+        if sample_strategy == "random":
+            # Use random_score for unbiased sampling
+            body["query"] = {
+                "function_score": {
+                    "query": body["query"],
+                    "random_score": {},
+                    "boost_mode": "replace",
+                }
+            }
+            logger.debug("Using random sampling strategy")
+        else:  # "recent" or default
+            body["sort"] = [{time_field: {"order": "desc"}}]
+            logger.debug(f"Using recent sampling strategy, sorted by {time_field}")
 
     logger.debug(f"Elasticsearch search body: {json.dumps(body, indent=2)}")
 
@@ -1011,11 +1047,16 @@ def summarize_logs(
     logger.debug(f"Slow paths: {slow_paths}")
 
     samples: List[Dict[str, Any]] = []
-    if include_samples:
+    if include_samples and actual_sample_size > 0:
         for hit in hits_section.get("hits", []):
             source = hit.get("_source") or {}
             if isinstance(source, dict):
-                samples.append(build_log_sample(source, fields))
+                sample = build_log_sample(source, fields)
+                # Apply message truncation
+                if "message" in sample and isinstance(sample["message"], str):
+                    if len(sample["message"]) > max_message_length:
+                        sample["message"] = sample["message"][:max_message_length] + "..."
+                samples.append(sample)
     logger.debug(f"Number of samples generated: {len(samples)}")
 
     status_summary: Dict[str, Any] = {"distribution": status_counts}
@@ -1052,7 +1093,21 @@ def summarize_logs(
 
     if samples:
         result["samples"] = samples
+        result["sampling_metadata"] = {
+            "strategy": sample_strategy,
+            "requested_size": sample_size,
+            "returned_size": len(samples),
+            "max_message_length": max_message_length,
+        }
         logger.debug("Samples added to result.")
+    elif sample_strategy != "none" and sample_size > 0:
+        # Indicate that sampling was requested but no samples were found
+        result["sampling_metadata"] = {
+            "strategy": sample_strategy,
+            "requested_size": sample_size,
+            "returned_size": 0,
+            "note": "No samples matched the query criteria",
+        }
 
     logger.debug(f"Final result keys: {list(result.keys())}")
     return result
@@ -1425,6 +1480,10 @@ def execute_search(
     Specific Language (DSL). It validates the query against a security policy (e.g.,
     no scripts) and applies safety limits (e.g., on result size) before execution.
 
+    NOTE: This tool returns full document sources which can be large. For better
+    performance with large datasets, consider using search_with_projection to limit
+    returned fields, or count_and_aggregate for statistics-only queries.
+
     Args:
         index: Name of the index or a list of index names/patterns to search.
         dsl: The Elasticsearch Query DSL payload as a dictionary. It can contain
@@ -1472,6 +1531,737 @@ def execute_search(
     }
 
 
+@server.tool()
+def search_with_projection(
+    index: Union[str, List[str]],
+    dsl: Dict[str, Any],
+    fields: Optional[List[str]] = None,
+    exclude_fields: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Execute search with field projection to reduce response size.
+
+    This tool allows you to retrieve only specific fields from documents,
+    dramatically reducing response payload size and preventing MCP host overload.
+    Field projection can reduce response sizes by 90-95% compared to returning
+    full documents.
+
+    Args:
+        index: Name of the index or a list of index names/patterns to search.
+        dsl: The Elasticsearch Query DSL payload as a dictionary.
+        fields: List of fields to include in the response (e.g., ["@timestamp",
+            "service_id", "status"]). If None and exclude_fields is also None,
+            returns all fields (not recommended for large datasets).
+        exclude_fields: List of fields to exclude from the response (e.g.,
+            ["stack_trace", "request_body"]). Only used if fields is None.
+
+    Returns:
+        Search results with only requested fields, plus metadata about the
+        projection applied.
+
+    Examples:
+        # Return only essential fields (reduces 20KB logs to ~200 bytes each)
+        search_with_projection(
+            index="logs-*",
+            dsl={"query": {"match": {"level": "ERROR"}}, "size": 50},
+            fields=["@timestamp", "service_id", "message", "trace_id"]
+        )
+
+        # Exclude large fields while keeping everything else
+        search_with_projection(
+            index="logs-*",
+            dsl={"query": {"match_all": {}}, "size": 100},
+            exclude_fields=["stack_trace", "request_body", "response_body"]
+        )
+    """
+
+    try:
+        prepared = validate_and_prepare_dsl(dsl)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    # Add field projection to DSL
+    if fields:
+        prepared["_source"] = fields
+    elif exclude_fields:
+        prepared["_source"] = {"excludes": exclude_fields}
+
+    client = get_es_client()
+    try:
+        response = client.search(index=index, body=prepared)
+    except es_exceptions.ElasticsearchException as exc:
+        return {"error": f"Search failed: {exc}"}
+
+    hits_section = response.get("hits", {})
+    raw_hits = hits_section.get("hits", [])
+    hits: List[Dict[str, Any]] = []
+
+    for hit in raw_hits:
+        hits.append({
+            "_id": hit.get("_id"),
+            "_index": hit.get("_index"),
+            "_score": hit.get("_score"),
+            "_source": hit.get("_source"),  # Now contains only requested fields
+        })
+
+    total_value = hits_section.get("total")
+    if isinstance(total_value, dict):
+        total_count = total_value.get("value", 0)
+    elif isinstance(total_value, int):
+        total_count = total_value
+    else:
+        total_count = 0
+
+    # Add metadata about response size reduction
+    metadata = {
+        "projected_fields": fields,
+        "excluded_fields": exclude_fields,
+        "documents_returned": len(hits),
+    }
+
+    return {
+        "tookMs": response.get("took", 0),
+        "total": total_count,
+        "hits": hits,
+        "aggs": response.get("aggregations"),
+        "timed_out": response.get("timed_out", False),
+        "metadata": metadata,
+    }
+
+
+@server.tool()
+def count_and_aggregate(
+    index: Union[str, List[str]],
+    query: Optional[Dict[str, Any]] = None,
+    aggregations: Optional[Dict[str, Any]] = None,
+    time_range: Optional[Dict[str, str]] = None,
+    time_field: str = "@timestamp",
+) -> Dict[str, Any]:
+    """Execute aggregation-only query without retrieving any documents.
+
+    This tool is optimized for statistical analysis and counting operations.
+    It never retrieves document sources, making it safe for analyzing millions
+    of records without overwhelming the MCP host. Responses are typically just
+    a few KB even when analyzing huge datasets.
+
+    Args:
+        index: Name of the index or a list of index names/patterns to search.
+        query: Elasticsearch query clause (optional, defaults to match_all).
+            Example: {"term": {"level": "ERROR"}}
+        aggregations: Aggregation definitions (optional).
+            Example: {"by_service": {"terms": {"field": "service_id.keyword", "size": 20}}}
+        time_range: Time range filter with 'gte' and/or 'lte' keys (optional).
+            Example: {"gte": "now-1h"} or {"gte": "now-7d", "lte": "now-1d"}
+        time_field: Field to use for time_range filter. Defaults to "@timestamp".
+
+    Returns:
+        Only aggregation results and total count - NO document sources returned.
+
+    Examples:
+        # Count errors by service over last hour
+        count_and_aggregate(
+            index="logs-*",
+            query={"term": {"level": "ERROR"}},
+            time_range={"gte": "now-1h"},
+            aggregations={
+                "by_service": {
+                    "terms": {"field": "service_id.keyword", "size": 20}
+                }
+            }
+        )
+
+        # Get response time percentiles without retrieving logs
+        count_and_aggregate(
+            index="logs-*",
+            aggregations={
+                "latency_stats": {
+                    "percentiles": {
+                        "field": "response_time",
+                        "percents": [50, 90, 95, 99]
+                    }
+                }
+            }
+        )
+
+        # Simple count with time range
+        count_and_aggregate(
+            index="logs-*",
+            query={"match": {"message": "timeout"}},
+            time_range={"gte": "now-24h"}
+        )
+
+        # Complex multi-level aggregation
+        count_and_aggregate(
+            index="logs-*",
+            aggregations={
+                "by_service": {
+                    "terms": {"field": "service_id.keyword", "size": 10},
+                    "aggs": {
+                        "status_breakdown": {
+                            "terms": {"field": "status.keyword", "size": 5}
+                        },
+                        "avg_latency": {
+                            "avg": {"field": "response_time"}
+                        }
+                    }
+                }
+            }
+        )
+    """
+
+    indices = normalize_indices_param(index)
+    if not indices:
+        return {"error": "index must be provided"}
+
+    # Build query
+    bool_query: Dict[str, Any] = {"must": [], "filter": []}
+
+    if query:
+        bool_query["must"].append(query)
+    else:
+        bool_query["must"].append({"match_all": {}})
+
+    if time_range:
+        bool_query["filter"].append({"range": {time_field: time_range}})
+
+    # Build request body - size=0 means NO documents returned
+    body: Dict[str, Any] = {
+        "size": 0,  # CRITICAL: No documents
+        "query": {"bool": bool_query},
+        "timeout": f"{SEARCH_TIMEOUT_MS}ms",
+        "track_total_hits": True,
+    }
+
+    if aggregations:
+        body["aggs"] = aggregations
+
+    client = get_es_client()
+    try:
+        response = client.search(index=indices, body=body)
+    except es_exceptions.ElasticsearchException as exc:
+        return {"error": f"Aggregation failed: {exc}"}
+
+    total_value = response.get("hits", {}).get("total")
+    if isinstance(total_value, dict):
+        total_count = total_value.get("value", 0)
+    elif isinstance(total_value, int):
+        total_count = total_value
+    else:
+        total_count = 0
+
+    return {
+        "tookMs": response.get("took", 0),
+        "total_count": total_count,
+        "aggregations": response.get("aggregations", {}),
+        "timed_out": response.get("timed_out", False),
+        "metadata": {
+            "documents_returned": 0,
+            "aggregations_only": True,
+            "query_applied": query is not None,
+            "time_filter_applied": time_range is not None,
+        }
+    }
+
+
+@server.tool()
+def search_paginated(
+    index: Union[str, List[str]],
+    dsl: Dict[str, Any],
+    page_size: int = 10,
+    search_after: Optional[List[Any]] = None,
+    fields: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Execute paginated search using search_after for efficient deep pagination.
+
+    This tool enables retrieving large result sets in manageable chunks without
+    overwhelming the MCP host. Use the 'next_page_token' from the response to
+    fetch subsequent pages. This is more efficient than from/size for deep
+    pagination and doesn't maintain server-side state like scroll.
+
+    Args:
+        index: Name of the index or a list of index names/patterns to search.
+        dsl: Elasticsearch Query DSL (must include a sort clause for pagination).
+        page_size: Number of results per page (max 100, default 10).
+        search_after: Token from previous page's 'next_page_token' field.
+            Omit for the first page. This is an array of sort values.
+        fields: Optional field projection to reduce response size.
+            Example: ["@timestamp", "service_id", "message"]
+
+    Returns:
+        Paginated results with next_page_token for continuation.
+
+    Important:
+        - The DSL MUST include a sort clause for pagination to work
+        - Include a unique field (like _id) in sort to ensure consistent ordering
+        - Recommended sort: [{"@timestamp": "desc"}, {"_id": "desc"}]
+
+    Examples:
+        # First page
+        page1 = search_paginated(
+            index="logs-*",
+            dsl={
+                "query": {"match": {"level": "ERROR"}},
+                "sort": [{"@timestamp": "desc"}, {"_id": "desc"}]
+            },
+            page_size=50,
+            fields=["@timestamp", "message", "service_id"]
+        )
+
+        # Next page using token from previous response
+        page2 = search_paginated(
+            index="logs-*",
+            dsl={
+                "query": {"match": {"level": "ERROR"}},
+                "sort": [{"@timestamp": "desc"}, {"_id": "desc"}]
+            },
+            page_size=50,
+            search_after=page1["next_page_token"],
+            fields=["@timestamp", "message", "service_id"]
+        )
+
+        # Continue until has_next_page is False
+        page3 = search_paginated(
+            index="logs-*",
+            dsl={...},
+            page_size=50,
+            search_after=page2["next_page_token"],
+            fields=[...]
+        )
+    """
+
+    try:
+        prepared = validate_and_prepare_dsl(dsl)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    # Validate sort clause exists
+    if "sort" not in prepared:
+        return {
+            "error": (
+                "sort clause required for pagination. "
+                "Add a sort clause to your DSL to enable pagination. "
+                "Recommended: 'sort': [{'@timestamp': 'desc'}, {'_id': 'desc'}]"
+            )
+        }
+
+    # Clamp page size
+    actual_page_size = max(1, min(page_size, 100))
+    prepared["size"] = actual_page_size
+
+    # Add search_after for pagination (skip on first page)
+    if search_after:
+        prepared["search_after"] = search_after
+
+    # Add field projection if specified
+    if fields:
+        prepared["_source"] = fields
+
+    client = get_es_client()
+    try:
+        response = client.search(index=index, body=prepared)
+    except es_exceptions.ElasticsearchException as exc:
+        return {"error": f"Search failed: {exc}"}
+
+    hits_section = response.get("hits", {})
+    raw_hits = hits_section.get("hits", [])
+    hits: List[Dict[str, Any]] = []
+    next_page_token = None
+
+    for hit in raw_hits:
+        hits.append({
+            "_id": hit.get("_id"),
+            "_index": hit.get("_index"),
+            "_score": hit.get("_score"),
+            "_source": hit.get("_source"),
+        })
+
+    # Extract search_after value from last hit for next page
+    if raw_hits:
+        last_hit = raw_hits[-1]
+        next_page_token = last_hit.get("sort")
+
+    total_value = hits_section.get("total")
+    if isinstance(total_value, dict):
+        total_count = total_value.get("value", 0)
+    elif isinstance(total_value, int):
+        total_count = total_value
+    else:
+        total_count = 0
+
+    # Determine if there's a next page
+    has_next_page = len(hits) == actual_page_size and next_page_token is not None
+
+    return {
+        "tookMs": response.get("took", 0),
+        "total": total_count,
+        "hits": hits,
+        "page_size": actual_page_size,
+        "documents_in_page": len(hits),
+        "has_next_page": has_next_page,
+        "next_page_token": next_page_token,
+        "timed_out": response.get("timed_out", False),
+        "metadata": {
+            "projected_fields": fields,
+            "pagination_enabled": True,
+            "current_page_size": len(hits),
+        }
+    }
+
+
+@server.tool()
+def estimate_response_size(
+    index: Union[str, List[str]],
+    dsl: Dict[str, Any],
+    include_fields: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Estimate the response size before executing a search.
+
+    This tool helps users understand how much data a query will return before
+    actually executing it. Use this to avoid overwhelming the MCP host with
+    unexpectedly large responses. The tool samples a few documents to estimate
+    average size and projects the total response size.
+
+    Args:
+        index: Name of the index or a list of index names/patterns to search.
+        dsl: The query DSL you plan to execute.
+        include_fields: Optional field projection to estimate with. If provided,
+            the estimate will account for field projection savings.
+
+    Returns:
+        Estimated response size and recommendations for optimization.
+
+    Examples:
+        # Check a potentially large query
+        estimate = estimate_response_size(
+            index="logs-*",
+            dsl={"query": {"range": {"@timestamp": {"gte": "now-7d"}}}, "size": 200}
+        )
+
+        if estimate["safe_to_execute"]:
+            # Proceed with execute_search
+            pass
+        else:
+            # Use recommended optimization
+            print(estimate["recommendations"])
+
+        # Estimate with field projection
+        estimate_with_projection = estimate_response_size(
+            index="logs-*",
+            dsl={"query": {...}, "size": 200},
+            include_fields=["@timestamp", "service", "message"]
+        )
+    """
+
+    try:
+        prepared = validate_and_prepare_dsl(dsl)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    client = get_es_client()
+
+    # First, get a count of matching documents
+    count_body = {
+        "query": prepared.get("query", {"match_all": {}}),
+        "size": 0,
+        "track_total_hits": True,
+        "timeout": f"{SEARCH_TIMEOUT_MS}ms",
+    }
+
+    try:
+        count_response = client.search(index=index, body=count_body)
+    except es_exceptions.ElasticsearchException as exc:
+        return {"error": f"Failed to estimate size: {exc}"}
+
+    total_value = count_response.get("hits", {}).get("total")
+    if isinstance(total_value, dict):
+        total_matches = total_value.get("value", 0)
+    elif isinstance(total_value, int):
+        total_matches = total_value
+    else:
+        total_matches = 0
+
+    if total_matches == 0:
+        return {
+            "total_matches": 0,
+            "estimated_response_kb": 0,
+            "safe_to_execute": True,
+            "recommendations": ["No documents match the query."],
+        }
+
+    # Sample a few documents to estimate average size
+    sample_size = min(5, total_matches)
+    sample_body = {
+        "query": prepared.get("query", {"match_all": {}}),
+        "size": sample_size,
+        "timeout": f"{SEARCH_TIMEOUT_MS}ms",
+    }
+
+    if include_fields:
+        sample_body["_source"] = include_fields
+
+    try:
+        sample_response = client.search(index=index, body=sample_body)
+    except es_exceptions.ElasticsearchException:
+        avg_doc_size_kb = 10.0  # Fallback estimate
+    else:
+        hits = sample_response.get("hits", {}).get("hits", [])
+        if hits:
+            total_sample_size = sum(len(json.dumps(hit.get("_source", {}))) for hit in hits)
+            avg_doc_size_kb = (total_sample_size / len(hits)) / 1024
+        else:
+            avg_doc_size_kb = 10.0
+
+    # Calculate estimates
+    requested_size = prepared.get("size", 10)
+    docs_to_return = min(requested_size, total_matches)
+    estimated_response_kb = docs_to_return * avg_doc_size_kb
+
+    # Determine safety
+    safe_threshold_kb = 1000  # 1MB threshold
+    safe_to_execute = estimated_response_kb < safe_threshold_kb
+
+    # Generate recommendations
+    recommendations = []
+
+    if not safe_to_execute:
+        recommendations.append(
+            f"⚠️ Response may be {estimated_response_kb:.1f}KB ({estimated_response_kb/1024:.2f}MB). "
+            "This could overwhelm the MCP host."
+        )
+
+        if not include_fields:
+            projected_size = estimated_response_kb * 0.1  # Assume 90% reduction
+            recommendations.append(
+                f"✅ Use search_with_projection to limit fields. "
+                f"Estimated size with projection: ~{projected_size:.1f}KB (90% reduction)"
+            )
+
+        if requested_size > 50:
+            recommendations.append(
+                f"✅ Use search_paginated to fetch {requested_size} documents in chunks of 50. "
+                f"Each page would be ~{(50 * avg_doc_size_kb):.1f}KB."
+            )
+
+        recommendations.append(
+            "✅ Use count_and_aggregate if you only need statistics (response: <10KB)."
+        )
+
+    if total_matches > requested_size:
+        recommendations.append(
+            f"ℹ️ Query matches {total_matches} documents but only {requested_size} will be returned. "
+            "Use search_paginated for full results or increase 'size' in DSL."
+        )
+
+    if not recommendations:
+        recommendations.append("✅ Response size is within safe limits. Proceed with query.")
+
+    # Calculate potential savings with field projection
+    if not include_fields:
+        projected_with_fields = estimated_response_kb * 0.1
+        size_savings = {
+            "current_estimate_kb": round(estimated_response_kb, 2),
+            "with_field_projection_kb": round(projected_with_fields, 2),
+            "savings_kb": round(estimated_response_kb - projected_with_fields, 2),
+            "savings_percent": 90,
+        }
+    else:
+        size_savings = None
+
+    return {
+        "total_matches": total_matches,
+        "requested_size": requested_size,
+        "docs_to_return": docs_to_return,
+        "avg_doc_size_kb": round(avg_doc_size_kb, 2),
+        "estimated_response_kb": round(estimated_response_kb, 2),
+        "estimated_response_mb": round(estimated_response_kb / 1024, 2),
+        "safe_to_execute": safe_to_execute,
+        "safe_threshold_kb": safe_threshold_kb,
+        "recommendations": recommendations,
+        "with_field_projection": include_fields is not None,
+        "size_savings": size_savings,
+    }
+
+
+@server.tool()
+def sample_logs_stratified(
+    index: Union[str, List[str]],
+    lookback: str = "now-24h",
+    strata_field: str = "response_status",
+    samples_per_stratum: int = 2,
+    time_field: str = "@timestamp",
+    field_overrides: Optional[Dict[str, str]] = None,
+    max_strata: int = 10,
+) -> Dict[str, Any]:
+    """Retrieve representative log samples using stratified sampling.
+
+    Instead of just fetching the most recent logs, this tool samples across
+    different categories (strata) to give a balanced view. For example, sample
+    both successful and failed requests, or sample from each service. This
+    provides better representation than simple chronological sampling.
+
+    Args:
+        index: Name of the index or a list of index names/patterns to search.
+        lookback: Time window to sample from (e.g., "now-24h", "now-7d").
+            Defaults to "now-24h".
+        strata_field: Field to stratify by (e.g., "response_status", "service_id",
+            "level"). The tool will sample from each unique value of this field.
+        samples_per_stratum: Number of samples to take from each stratum.
+            Defaults to 2. Total samples = strata_count * samples_per_stratum.
+        time_field: Field containing timestamp. Defaults to "@timestamp".
+        field_overrides: Optional dictionary to manually specify field names.
+        max_strata: Maximum number of strata to sample from (default 10).
+            Limits total response size.
+
+    Returns:
+        Samples organized by stratum with metadata about the stratification.
+
+    Examples:
+        # Sample 2 logs from each HTTP status code
+        sample_logs_stratified(
+            index="logs-*",
+            strata_field="response_status",
+            samples_per_stratum=2
+        )
+        # Returns: {"200": [<2 samples>], "404": [<2 samples>], "500": [<2 samples>]}
+
+        # Sample from each service
+        sample_logs_stratified(
+            index="logs-*",
+            strata_field="service_id.keyword",
+            samples_per_stratum=3,
+            lookback="now-1h"
+        )
+
+        # Sample by log level (ERROR, WARN, INFO)
+        sample_logs_stratified(
+            index="logs-*",
+            strata_field="level.keyword",
+            samples_per_stratum=5
+        )
+    """
+
+    indices = normalize_indices_param(index)
+    if not indices:
+        return {"error": "index must be provided"}
+
+    client = get_es_client()
+    inventory = extract_field_inventory_for_indices(indices)
+    fields = resolve_log_fields(field_overrides)
+
+    # Resolve the strata field to its aggregatable version
+    strata_agg_field = ensure_terms_field(strata_field, inventory) or strata_field
+
+    # Check if the strata field is numeric to handle missing values correctly
+    strata_is_numeric = field_is_numeric(strata_field, inventory)
+    strata_terms_config = {
+        "field": strata_agg_field,
+        "size": max_strata * 2,  # Get more to show top strata
+        "order": {"_count": "desc"}
+    }
+    # Add appropriate missing value based on field type
+    if strata_is_numeric:
+        strata_terms_config["missing"] = -1  # Use -1 for numeric fields
+    else:
+        strata_terms_config["missing"] = "UNKNOWN"  # Use string for text fields
+
+    # First, get the distribution of the strata field
+    agg_body = {
+        "size": 0,
+        "query": {
+            "bool": {
+                "filter": build_time_filters(lookback, time_field)
+            }
+        },
+        "aggs": {
+            "strata": {
+                "terms": strata_terms_config
+            }
+        },
+        "timeout": f"{SEARCH_TIMEOUT_MS}ms",
+    }
+
+    try:
+        agg_response = client.search(index=indices, body=agg_body)
+    except es_exceptions.ElasticsearchException as exc:
+        return {"error": f"Failed to determine strata: {exc}"}
+
+    strata_buckets = agg_response.get("aggregations", {}).get("strata", {}).get("buckets", [])
+
+    if not strata_buckets:
+        return {
+            "error": f"No data found for strata field '{strata_field}' in time window",
+            "strata_field": strata_field,
+            "time_window": {"gte": lookback, "lte": "now"},
+        }
+
+    # Now sample from each stratum (limit to max_strata)
+    samples_by_stratum: Dict[str, List[Dict[str, Any]]] = {}
+    strata_metadata: List[Dict[str, Any]] = []
+    total_sampled = 0
+
+    for bucket in strata_buckets[:max_strata]:
+        stratum_value = bucket.get("key")
+        stratum_count = bucket.get("doc_count", 0)
+
+        if stratum_count == 0:
+            continue
+
+        # Query for samples from this stratum
+        sample_body = {
+            "size": samples_per_stratum,
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {strata_agg_field: stratum_value}},
+                        *build_time_filters(lookback, time_field)
+                    ]
+                }
+            },
+            "sort": [{time_field: {"order": "desc"}}],  # Most recent within stratum
+            "timeout": f"{SEARCH_TIMEOUT_MS}ms",
+        }
+
+        try:
+            sample_response = client.search(index=indices, body=sample_body)
+        except es_exceptions.ElasticsearchException:
+            continue
+
+        hits = sample_response.get("hits", {}).get("hits", [])
+        samples = []
+        for hit in hits:
+            source = hit.get("_source") or {}
+            if isinstance(source, dict):
+                samples.append(build_log_sample(source, fields))
+
+        if samples:
+            samples_by_stratum[str(stratum_value)] = samples
+            total_sampled += len(samples)
+            strata_metadata.append({
+                "value": str(stratum_value),
+                "total_count": stratum_count,
+                "samples_retrieved": len(samples),
+            })
+
+    # Calculate summary statistics
+    total_docs_in_strata = sum(s["total_count"] for s in strata_metadata)
+
+    return {
+        "strata_field": strata_field,
+        "samples_per_stratum": samples_per_stratum,
+        "total_strata_found": len(strata_buckets),
+        "strata_sampled": len(samples_by_stratum),
+        "total_samples": total_sampled,
+        "total_documents_in_strata": total_docs_in_strata,
+        "samples": samples_by_stratum,
+        "strata_metadata": strata_metadata,
+        "time_window": {"gte": lookback, "lte": "now"},
+        "sampling_notes": [
+            f"Sampled from top {len(samples_by_stratum)} strata by document count",
+            f"Each stratum provides up to {samples_per_stratum} samples",
+            "Samples within each stratum are the most recent",
+        ]
+    }
+
+
 if ENABLE_PLANNER:
     @server.tool()
     def plan_query(
@@ -1516,6 +2306,11 @@ def log_startup() -> None:
         "get_field_caps",
         "sample_values",
         "execute_search",
+        "search_with_projection",
+        "count_and_aggregate",
+        "search_paginated",
+        "estimate_response_size",
+        "sample_logs_stratified",
     ]
     if ENABLE_PLANNER:
         tools_enabled.append("plan_query")
@@ -1524,6 +2319,9 @@ def log_startup() -> None:
         f"{ES_URL} api_key={'yes' if ES_API_KEY else 'no'} tools={','.join(tools_enabled)}"
     )
     print("[mcp-elastic] Typical flow: list_indices -> get_mapping -> execute_search")
+    print("[mcp-elastic] Phase 1: count_and_aggregate (stats only) or search_with_projection (field filtering)")
+    print("[mcp-elastic] Phase 2: search_paginated (large datasets), estimate_response_size (safety check), sample_logs_stratified (balanced sampling)")
+    print("[mcp-elastic] Enhanced summarize_logs: configurable sampling (size, strategy, message truncation)")
     if ENABLE_PLANNER:
         print("[mcp-elastic] Planner flow: plan_query -> execute_search")
 
