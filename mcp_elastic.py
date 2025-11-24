@@ -805,30 +805,16 @@ def summarize_logs(
     sample_strategy: str = "recent",
     max_message_length: int = 500,
 ) -> Dict[str, Any]:
-    """Generates a high-level summary of log data from specified indices.
-
-    This tool automatically discovers common log fields (like service, status, response time)
-    and computes key metrics such as total log count, status code distribution, error rates,
-    top users/services, and slowest API paths. It's ideal for getting a quick overview
-    of log activity over a given time period.
+    """Get high-level log summary (error rates, top services) with optional sampling.
 
     Args:
-        index: Name of the index or a list of index names/patterns to search
-            (e.g., "logs-*" or ["logs-prod", "logs-dev"]).
-        lookback: The time window to analyze. Uses Elasticsearch date math
-            (e.g., "now-24h", "now-7d"). Defaults to "now-24h".
-        field_overrides: Optional dictionary to manually specify field names for
-            roles like 'service', 'status', 'user', etc., if auto-discovery is
-            insufficient.
-        include_samples: If True, includes log samples in the summary. Defaults to True.
-        sample_size: Number of log samples to include (0-10). Defaults to 3. Set to 0
-            for aggregations-only results with minimal response size.
-        sample_strategy: How to sample logs. Options:
-            - "recent": Most recent logs (default, sorted by time descending)
-            - "random": Random sampling for unbiased representation
-            - "none": No samples, aggregations only (same as sample_size=0)
-        max_message_length: Maximum length for log message fields in samples.
-            Messages longer than this will be truncated. Defaults to 500 characters.
+        index: Index name/pattern (e.g., "logs-*").
+        lookback: Time window (e.g., "now-24h").
+        field_overrides: Optional field mapping overrides.
+        include_samples: Include log samples (default: True).
+        sample_size: Number of samples (0-10).
+        sample_strategy: "recent", "random", or "none".
+        max_message_length: Truncate messages to this length.
     """
 
     logger.debug(f"summarize_logs called with index={index}, lookback={lookback}, include_samples={include_samples}")
@@ -1120,21 +1106,13 @@ def log_trend(
     interval: str = "1h",
     field_overrides: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
-    """Analyzes log data over time to provide trend information.
-
-    This tool buckets logs by a specified time interval and calculates metrics for each
-    bucket, such as the total count, status code distribution, and average response time.
-    It is useful for understanding patterns, spotting spikes in errors, or tracking
-    performance changes.
+    """Get log volume and error trends over time buckets.
 
     Args:
-        index: Name of the index or a list of index names/patterns to search.
-        lookback: The total time window to analyze (e.g., "now-24h").
-            Defaults to "now-24h".
-        interval: The duration of each time bucket for the trend analysis
-            (e.g., "1h", "15m", "1d"). Defaults to "1h".
-        field_overrides: Optional dictionary to manually specify field names for
-            'time', 'status', and 'response_time'.
+        index: Index name/pattern.
+        lookback: Total time window (e.g., "now-24h").
+        interval: Bucket size (e.g., "1h").
+        field_overrides: Optional field mapping overrides.
     """
 
     indices = normalize_indices_param(index)
@@ -1226,18 +1204,13 @@ def sample_trace(
     size: int = 10,
     field_overrides: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
-    """Retrieves log events associated with a specific trace ID.
-
-    This is useful for debugging and following the lifecycle of a single request as it
-    propagates through multiple services. The tool returns a sample of log events for
-    the trace, along with a summary of span counts and status distributions within it.
+    """Get events for a specific trace ID to visualize request journey.
 
     Args:
-        index: Name of the index or a list of index names/patterns to search.
-        trace_id: The unique identifier of the trace to retrieve.
-        size: The maximum number of log events to return. Defaults to 10.
-        field_overrides: Optional dictionary to manually specify field names for
-            'trace_id', 'span_id', etc.
+        index: Index name/pattern.
+        trace_id: Unique trace identifier.
+        size: Max events (default: 10).
+        field_overrides: Optional field mapping overrides.
     """
 
     if not trace_id:
@@ -1284,8 +1257,16 @@ def sample_trace(
         }
 
     if status_field:
+        # Check if status field is numeric to avoid "For input string: 'UNKNOWN'" error
+        is_numeric_status = False
+        status_info = find_field_info(status_field, inventory)
+        if status_info and status_info.get("isNumeric"):
+            is_numeric_status = True
+        
+        missing_val = -1 if is_numeric_status else "UNKNOWN"
+        
         body["aggs"]["status_counts"] = {
-            "terms": {"field": status_field, "size": 5, "missing": "UNKNOWN"}
+            "terms": {"field": status_field, "size": 5, "missing": missing_val}
         }
 
     try:
@@ -1323,15 +1304,10 @@ def sample_trace(
 
 @server.tool()
 def list_indices(prefix: str = "") -> Dict[str, Any]:
-    """Lists available Elasticsearch indices, with optional filtering by prefix.
-
-    This tool provides a list of all indices in the cluster, including their document
-    count and storage size. It can be used to discover available data sources before
-    querying.
+    """List indices with doc counts and size.
 
     Args:
-        prefix: An optional string prefix to filter the list of indices. If provided,
-            only indices whose names start with this prefix are returned. Defaults to "".
+        prefix: Filter by index name prefix.
     """
 
     client = get_es_client()
@@ -1363,14 +1339,10 @@ def list_indices(prefix: str = "") -> Dict[str, Any]:
 
 @server.tool()
 def get_mapping(index: str) -> Dict[str, Any]:
-    """Retrieves the mapping for a specified index.
-
-    The mapping defines the structure and data types of the fields within an index.
-    This tool returns a flattened list of all fields and their properties (e.g., type,
-    isNumeric, isDate), which is essential for constructing accurate queries.
+    """Get flattened field mapping for an index.
 
     Args:
-        index: The name of the index for which to retrieve the mapping.
+        index: Index name.
     """
 
     cache_key = f"mapping:{index}"
@@ -1395,15 +1367,10 @@ def get_mapping(index: str) -> Dict[str, Any]:
 
 @server.tool()
 def get_field_caps(indices: List[str]) -> Dict[str, Any]:
-    """Retrieves the capabilities of fields across one or more indices.
-
-    Field capabilities describe whether a field is searchable and aggregatable. This is
-    useful for determining which fields can be used in queries and aggregations,
-    especially when dealing with multiple indices that may have different mappings.
+    """Check if fields are searchable/aggregatable.
 
     Args:
-        indices: A list of index names or patterns for which to retrieve field
-            capabilities.
+        indices: List of index names.
     """
 
     if not indices:
@@ -1427,17 +1394,12 @@ def get_field_caps(indices: List[str]) -> Dict[str, Any]:
 
 @server.tool()
 def sample_values(index: str, field: str, size: int = 10) -> Dict[str, Any]:
-    """Retrieves a sample of unique values for a specific field.
-
-    This tool runs a terms aggregation to find the most common values for a given field.
-    It is useful for understanding the data distribution within a field or for getting
-    example values to use in a query filter.
+    """Get unique value samples for a field.
 
     Args:
-        index: The name of the index to query.
-        field: The field from which to sample values (e.g., "service_id.keyword").
-            For text fields, use the ".keyword" variant for accurate term aggregation.
-        size: The maximum number of unique sample values to return. Defaults to 10.
+        index: Index name.
+        field: Field name (use .keyword for text).
+        size: Max samples (default: 10).
     """
 
     client = get_es_client()
@@ -1474,20 +1436,11 @@ def execute_search(
     index: Union[str, List[str]],
     dsl: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Executes a raw Elasticsearch Query DSL search.
-
-    This tool provides a direct way to query Elasticsearch using its native Domain
-    Specific Language (DSL). It validates the query against a security policy (e.g.,
-    no scripts) and applies safety limits (e.g., on result size) before execution.
-
-    NOTE: This tool returns full document sources which can be large. For better
-    performance with large datasets, consider using search_with_projection to limit
-    returned fields, or count_and_aggregate for statistics-only queries.
+    """Execute raw Elasticsearch DSL query.
 
     Args:
-        index: Name of the index or a list of index names/patterns to search.
-        dsl: The Elasticsearch Query DSL payload as a dictionary. It can contain
-            'query', 'aggs', 'size', 'from', etc.
+        index: Index name/pattern.
+        dsl: Query DSL dict (query, aggs, size, etc).
     """
 
     try:
@@ -1538,40 +1491,13 @@ def search_with_projection(
     fields: Optional[List[str]] = None,
     exclude_fields: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Execute search with field projection to reduce response size.
-
-    This tool allows you to retrieve only specific fields from documents,
-    dramatically reducing response payload size and preventing MCP host overload.
-    Field projection can reduce response sizes by 90-95% compared to returning
-    full documents.
+    """Search with field projection to reduce size.
 
     Args:
-        index: Name of the index or a list of index names/patterns to search.
-        dsl: The Elasticsearch Query DSL payload as a dictionary.
-        fields: List of fields to include in the response (e.g., ["@timestamp",
-            "service_id", "status"]). If None and exclude_fields is also None,
-            returns all fields (not recommended for large datasets).
-        exclude_fields: List of fields to exclude from the response (e.g.,
-            ["stack_trace", "request_body"]). Only used if fields is None.
-
-    Returns:
-        Search results with only requested fields, plus metadata about the
-        projection applied.
-
-    Examples:
-        # Return only essential fields (reduces 20KB logs to ~200 bytes each)
-        search_with_projection(
-            index="logs-*",
-            dsl={"query": {"match": {"level": "ERROR"}}, "size": 50},
-            fields=["@timestamp", "service_id", "message", "trace_id"]
-        )
-
-        # Exclude large fields while keeping everything else
-        search_with_projection(
-            index="logs-*",
-            dsl={"query": {"match_all": {}}, "size": 100},
-            exclude_fields=["stack_trace", "request_body", "response_body"]
-        )
+        index: Index name/pattern.
+        dsl: Query DSL.
+        fields: Fields to include.
+        exclude_fields: Fields to exclude.
     """
 
     try:
@@ -1636,76 +1562,14 @@ def count_and_aggregate(
     time_range: Optional[Dict[str, str]] = None,
     time_field: str = "@timestamp",
 ) -> Dict[str, Any]:
-    """Execute aggregation-only query without retrieving any documents.
-
-    This tool is optimized for statistical analysis and counting operations.
-    It never retrieves document sources, making it safe for analyzing millions
-    of records without overwhelming the MCP host. Responses are typically just
-    a few KB even when analyzing huge datasets.
+    """Get stats/counts without documents (fast, low overhead).
 
     Args:
-        index: Name of the index or a list of index names/patterns to search.
-        query: Elasticsearch query clause (optional, defaults to match_all).
-            Example: {"term": {"level": "ERROR"}}
-        aggregations: Aggregation definitions (optional).
-            Example: {"by_service": {"terms": {"field": "service_id.keyword", "size": 20}}}
-        time_range: Time range filter with 'gte' and/or 'lte' keys (optional).
-            Example: {"gte": "now-1h"} or {"gte": "now-7d", "lte": "now-1d"}
-        time_field: Field to use for time_range filter. Defaults to "@timestamp".
-
-    Returns:
-        Only aggregation results and total count - NO document sources returned.
-
-    Examples:
-        # Count errors by service over last hour
-        count_and_aggregate(
-            index="logs-*",
-            query={"term": {"level": "ERROR"}},
-            time_range={"gte": "now-1h"},
-            aggregations={
-                "by_service": {
-                    "terms": {"field": "service_id.keyword", "size": 20}
-                }
-            }
-        )
-
-        # Get response time percentiles without retrieving logs
-        count_and_aggregate(
-            index="logs-*",
-            aggregations={
-                "latency_stats": {
-                    "percentiles": {
-                        "field": "response_time",
-                        "percents": [50, 90, 95, 99]
-                    }
-                }
-            }
-        )
-
-        # Simple count with time range
-        count_and_aggregate(
-            index="logs-*",
-            query={"match": {"message": "timeout"}},
-            time_range={"gte": "now-24h"}
-        )
-
-        # Complex multi-level aggregation
-        count_and_aggregate(
-            index="logs-*",
-            aggregations={
-                "by_service": {
-                    "terms": {"field": "service_id.keyword", "size": 10},
-                    "aggs": {
-                        "status_breakdown": {
-                            "terms": {"field": "status.keyword", "size": 5}
-                        },
-                        "avg_latency": {
-                            "avg": {"field": "response_time"}
-                        }
-                    }
-                }
-            }
-        )
+        index: Index name/pattern.
+        query: Optional query clause.
+        aggregations: Aggregation definitions.
+        time_range: Optional time filter (gte/lte).
+        time_field: Time field name.
     """
 
     indices = normalize_indices_param(index)
@@ -1770,62 +1634,14 @@ def search_paginated(
     search_after: Optional[List[Any]] = None,
     fields: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Execute paginated search using search_after for efficient deep pagination.
-
-    This tool enables retrieving large result sets in manageable chunks without
-    overwhelming the MCP host. Use the 'next_page_token' from the response to
-    fetch subsequent pages. This is more efficient than from/size for deep
-    pagination and doesn't maintain server-side state like scroll.
+    """Paginated search using search_after for large sets.
 
     Args:
-        index: Name of the index or a list of index names/patterns to search.
-        dsl: Elasticsearch Query DSL (must include a sort clause for pagination).
-        page_size: Number of results per page (max 100, default 10).
-        search_after: Token from previous page's 'next_page_token' field.
-            Omit for the first page. This is an array of sort values.
-        fields: Optional field projection to reduce response size.
-            Example: ["@timestamp", "service_id", "message"]
-
-    Returns:
-        Paginated results with next_page_token for continuation.
-
-    Important:
-        - The DSL MUST include a sort clause for pagination to work
-        - Include a unique field (like _id) in sort to ensure consistent ordering
-        - Recommended sort: [{"@timestamp": "desc"}, {"_id": "desc"}]
-
-    Examples:
-        # First page
-        page1 = search_paginated(
-            index="logs-*",
-            dsl={
-                "query": {"match": {"level": "ERROR"}},
-                "sort": [{"@timestamp": "desc"}, {"_id": "desc"}]
-            },
-            page_size=50,
-            fields=["@timestamp", "message", "service_id"]
-        )
-
-        # Next page using token from previous response
-        page2 = search_paginated(
-            index="logs-*",
-            dsl={
-                "query": {"match": {"level": "ERROR"}},
-                "sort": [{"@timestamp": "desc"}, {"_id": "desc"}]
-            },
-            page_size=50,
-            search_after=page1["next_page_token"],
-            fields=["@timestamp", "message", "service_id"]
-        )
-
-        # Continue until has_next_page is False
-        page3 = search_paginated(
-            index="logs-*",
-            dsl={...},
-            page_size=50,
-            search_after=page2["next_page_token"],
-            fields=[...]
-        )
+        index: Index name/pattern.
+        dsl: Query DSL (must include sort).
+        page_size: Results per page (max 100).
+        search_after: Token from previous page.
+        fields: Optional field projection.
     """
 
     try:
@@ -1913,42 +1729,12 @@ def estimate_response_size(
     dsl: Dict[str, Any],
     include_fields: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Estimate the response size before executing a search.
-
-    This tool helps users understand how much data a query will return before
-    actually executing it. Use this to avoid overwhelming the MCP host with
-    unexpectedly large responses. The tool samples a few documents to estimate
-    average size and projects the total response size.
+    """Estimate response size to prevent overload.
 
     Args:
-        index: Name of the index or a list of index names/patterns to search.
-        dsl: The query DSL you plan to execute.
-        include_fields: Optional field projection to estimate with. If provided,
-            the estimate will account for field projection savings.
-
-    Returns:
-        Estimated response size and recommendations for optimization.
-
-    Examples:
-        # Check a potentially large query
-        estimate = estimate_response_size(
-            index="logs-*",
-            dsl={"query": {"range": {"@timestamp": {"gte": "now-7d"}}}, "size": 200}
-        )
-
-        if estimate["safe_to_execute"]:
-            # Proceed with execute_search
-            pass
-        else:
-            # Use recommended optimization
-            print(estimate["recommendations"])
-
-        # Estimate with field projection
-        estimate_with_projection = estimate_response_size(
-            index="logs-*",
-            dsl={"query": {...}, "size": 200},
-            include_fields=["@timestamp", "service", "message"]
-        )
+        index: Index name/pattern.
+        dsl: Query DSL.
+        include_fields: Optional field projection.
     """
 
     try:
@@ -2091,52 +1877,16 @@ def sample_logs_stratified(
     field_overrides: Optional[Dict[str, str]] = None,
     max_strata: int = 10,
 ) -> Dict[str, Any]:
-    """Retrieve representative log samples using stratified sampling.
-
-    Instead of just fetching the most recent logs, this tool samples across
-    different categories (strata) to give a balanced view. For example, sample
-    both successful and failed requests, or sample from each service. This
-    provides better representation than simple chronological sampling.
+    """Stratified sampling (e.g. 2 logs per status code).
 
     Args:
-        index: Name of the index or a list of index names/patterns to search.
-        lookback: Time window to sample from (e.g., "now-24h", "now-7d").
-            Defaults to "now-24h".
-        strata_field: Field to stratify by (e.g., "response_status", "service_id",
-            "level"). The tool will sample from each unique value of this field.
-        samples_per_stratum: Number of samples to take from each stratum.
-            Defaults to 2. Total samples = strata_count * samples_per_stratum.
-        time_field: Field containing timestamp. Defaults to "@timestamp".
-        field_overrides: Optional dictionary to manually specify field names.
-        max_strata: Maximum number of strata to sample from (default 10).
-            Limits total response size.
-
-    Returns:
-        Samples organized by stratum with metadata about the stratification.
-
-    Examples:
-        # Sample 2 logs from each HTTP status code
-        sample_logs_stratified(
-            index="logs-*",
-            strata_field="response_status",
-            samples_per_stratum=2
-        )
-        # Returns: {"200": [<2 samples>], "404": [<2 samples>], "500": [<2 samples>]}
-
-        # Sample from each service
-        sample_logs_stratified(
-            index="logs-*",
-            strata_field="service_id.keyword",
-            samples_per_stratum=3,
-            lookback="now-1h"
-        )
-
-        # Sample by log level (ERROR, WARN, INFO)
-        sample_logs_stratified(
-            index="logs-*",
-            strata_field="level.keyword",
-            samples_per_stratum=5
-        )
+        index: Index name/pattern.
+        lookback: Time window.
+        strata_field: Field to stratify by (e.g. status).
+        samples_per_stratum: Samples per group.
+        time_field: Time field.
+        field_overrides: Optional overrides.
+        max_strata: Max groups.
     """
 
     indices = normalize_indices_param(index)
@@ -2262,6 +2012,354 @@ def sample_logs_stratified(
     }
 
 
+@server.tool()
+def get_cluster_health() -> Dict[str, Any]:
+    """Check cluster health (status, nodes, shards)."""
+    client = get_es_client()
+    try:
+        health = client.cluster.health()
+        return {
+            "status": health.get("status"),
+            "cluster_name": health.get("cluster_name"),
+            "number_of_nodes": health.get("number_of_nodes"),
+            "active_shards": health.get("active_shards"),
+            "unassigned_shards": health.get("unassigned_shards"),
+        }
+    except es_exceptions.ElasticsearchException as exc:
+        return {"error": f"Failed to get cluster health: {exc}"}
+
+
+@server.tool()
+def find_traces_by_user(
+    index: Union[str, List[str]],
+    user_id: str,
+    lookback: str = "now-24h",
+    size: int = 10,
+    field_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Find traces for a user.
+
+    Args:
+        index: Index name/pattern.
+        user_id: User ID.
+        lookback: Time window.
+        size: Max traces.
+        field_overrides: Optional overrides.
+    """
+    indices = normalize_indices_param(index)
+    if not indices:
+        return {"error": "index must be provided"}
+
+    client = get_es_client()
+    inventory = extract_field_inventory_for_indices(indices)
+    fields = resolve_log_fields(field_overrides)
+
+    user_field = ensure_terms_field(fields.get("user"), inventory)
+    trace_field = ensure_terms_field(fields.get("trace_id"), inventory)
+    time_field = fields.get("time", DEFAULT_TIME_FIELD) or DEFAULT_TIME_FIELD
+
+    if not user_field or not trace_field:
+        return {"error": "Could not identify user or trace_id fields. Please provide field_overrides."}
+
+    # Aggregation to find unique traces for the user
+    body = {
+        "size": 0,
+        "query": {
+            "bool": {
+                "must": [{"term": {user_field: user_id}}],
+                "filter": build_time_filters(lookback, time_field),
+            }
+        },
+        "aggs": {
+            "traces": {
+                "terms": {"field": trace_field, "size": size},
+                "aggs": {
+                    "latest_time": {"max": {"field": time_field}},
+                    "services": {
+                        "terms": {
+                            "field": ensure_terms_field(fields.get("service"), inventory) or "service.keyword",
+                            "size": 5
+                        }
+                    }
+                }
+            }
+        },
+        "timeout": f"{SEARCH_TIMEOUT_MS}ms",
+    }
+
+    try:
+        response = client.search(index=indices, body=body)
+    except es_exceptions.ElasticsearchException as exc:
+        return {"error": f"Failed to find traces: {exc}"}
+
+    traces = []
+    for bucket in response.get("aggregations", {}).get("traces", {}).get("buckets", []):
+        traces.append({
+            "trace_id": bucket.get("key"),
+            "count": bucket.get("doc_count"),
+            "last_seen": bucket.get("latest_time", {}).get("value_as_string"),
+            "services": [b.get("key") for b in bucket.get("services", {}).get("buckets", [])]
+        })
+
+    return {
+        "user_id": user_id,
+        "found_traces": len(traces),
+        "traces": traces,
+        "time_window": {"gte": lookback, "lte": "now"},
+    }
+
+
+@server.tool()
+def analyze_error_patterns(
+    index: Union[str, List[str]],
+    lookback: str = "now-24h",
+    size: int = 10,
+    field_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Group errors by message to find patterns.
+
+    Args:
+        index: Index name/pattern.
+        lookback: Time window.
+        size: Number of patterns.
+        field_overrides: Optional overrides.
+    """
+    indices = normalize_indices_param(index)
+    if not indices:
+        return {"error": "index must be provided"}
+
+    client = get_es_client()
+    inventory = extract_field_inventory_for_indices(indices)
+    fields = resolve_log_fields(field_overrides)
+
+    status_field = fields.get("status")
+    message_field = ensure_terms_field(fields.get("message"), inventory)
+    time_field = fields.get("time", DEFAULT_TIME_FIELD) or DEFAULT_TIME_FIELD
+    
+    # If message is text, we might need a keyword subfield for aggregation
+    # If auto-discovery failed to find a keyword version, we might resort to fielddata (risky)
+    # or just warn. Here we assume ensure_terms_field did its best.
+    
+    if not message_field:
+         return {"error": "Could not identify a suitable message field for aggregation."}
+
+    status_is_numeric = field_is_numeric(status_field, inventory)
+    
+    error_filter = None
+    if status_is_numeric:
+        error_filter = {"range": {status_field: {"gte": 400}}}
+    else:
+        # Heuristic for string status: matches 4xx or 5xx
+        error_filter = {"regexp": {status_field: "[45][0-9]{2}"}}
+
+    body = {
+        "size": 0,
+        "query": {
+            "bool": {
+                "filter": [
+                    error_filter,
+                    *build_time_filters(lookback, time_field)
+                ]
+            }
+        },
+        "aggs": {
+            "top_errors": {
+                "terms": {"field": message_field, "size": size},
+                "aggs": {
+                    "sample_services": {
+                        "terms": {
+                            "field": ensure_terms_field(fields.get("service"), inventory) or "service.keyword",
+                            "size": 3
+                        }
+                    }
+                }
+            }
+        },
+        "timeout": f"{SEARCH_TIMEOUT_MS}ms",
+    }
+
+    try:
+        response = client.search(index=indices, body=body)
+    except es_exceptions.ElasticsearchException as exc:
+        return {"error": f"Failed to analyze errors: {exc}"}
+
+    patterns = []
+    for bucket in response.get("aggregations", {}).get("top_errors", {}).get("buckets", []):
+        patterns.append({
+            "error_message": bucket.get("key"),
+            "count": bucket.get("doc_count"),
+            "affected_services": [b.get("key") for b in bucket.get("sample_services", {}).get("buckets", [])]
+        })
+
+    return {
+        "time_window": {"gte": lookback, "lte": "now"},
+        "patterns": patterns,
+    }
+
+
+@server.tool()
+def get_metric_statistics(
+    index: Union[str, List[str]],
+    field: str,
+    metric: str = "avg",
+    lookback: str = "now-1h",
+    interval: Optional[str] = None,
+    field_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Calculate numeric metrics (avg, max, min, sum).
+
+    Args:
+        index: Index name/pattern.
+        field: Numeric field.
+        metric: Metric type.
+        lookback: Time window.
+        interval: Optional bucket size for trend.
+        field_overrides: Optional overrides.
+    """
+    indices = normalize_indices_param(index)
+    if not indices:
+        return {"error": "index must be provided"}
+
+    client = get_es_client()
+    inventory = extract_field_inventory_for_indices(indices)
+    fields = resolve_log_fields(field_overrides)
+    time_field = fields.get("time", DEFAULT_TIME_FIELD) or DEFAULT_TIME_FIELD
+
+    # Ensure field exists and get its correct name (though for metrics we usually want the exact name)
+    # We check if it's numeric, but cardinality can run on keywords too.
+    target_field = field
+    info = find_field_info(field, inventory)
+    if not info:
+        # Try to find it in inventory by name match
+        info = next((f for f in inventory if f["name"] == field), None)
+    
+    if info:
+        target_field = info["name"]
+        if metric != "cardinality" and not info.get("isNumeric"):
+             return {"error": f"Field '{field}' is not numeric. Cannot calculate '{metric}'."}
+
+    valid_metrics = {"avg", "max", "min", "sum", "cardinality", "value_count"}
+    if metric not in valid_metrics:
+        return {"error": f"Invalid metric '{metric}'. Must be one of {valid_metrics}"}
+
+    agg_def = {metric: {"field": target_field}}
+    
+    aggs = {}
+    if interval:
+        aggs["trend"] = {
+            "date_histogram": {
+                "field": time_field,
+                "fixed_interval": interval,
+                "min_doc_count": 0
+            },
+            "aggs": {"metric_value": agg_def}
+        }
+    else:
+        aggs["overall_metric"] = agg_def
+
+    body = {
+        "size": 0,
+        "query": {
+            "bool": {
+                "filter": build_time_filters(lookback, time_field)
+            }
+        },
+        "aggs": aggs,
+        "timeout": f"{SEARCH_TIMEOUT_MS}ms",
+    }
+
+    try:
+        response = client.search(index=indices, body=body)
+    except es_exceptions.ElasticsearchException as exc:
+        return {"error": f"Failed to calculate metrics: {exc}"}
+
+    result = {
+        "metric": metric,
+        "field": target_field,
+        "time_window": {"gte": lookback, "lte": "now"},
+    }
+
+    if interval:
+        buckets = response.get("aggregations", {}).get("trend", {}).get("buckets", [])
+        trend_data = []
+        for bucket in buckets:
+            val = bucket.get("metric_value", {}).get("value")
+            trend_data.append({
+                "timestamp": bucket.get("key_as_string"),
+                "value": val
+            })
+        result["trend"] = trend_data
+        result["interval"] = interval
+    else:
+        val = response.get("aggregations", {}).get("overall_metric", {}).get("value")
+        result["value"] = val
+
+    return result
+
+
+@server.tool()
+def get_top_values(
+    index: Union[str, List[str]],
+    field: str,
+    size: int = 10,
+    lookback: str = "now-24h",
+    field_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Find most frequent values for a field.
+
+    Args:
+        index: Index name/pattern.
+        field: Field to aggregate.
+        size: Number of results.
+        lookback: Time window.
+        field_overrides: Optional overrides.
+    """
+    indices = normalize_indices_param(index)
+    if not indices:
+        return {"error": "index must be provided"}
+
+    client = get_es_client()
+    inventory = extract_field_inventory_for_indices(indices)
+    fields = resolve_log_fields(field_overrides)
+    time_field = fields.get("time", DEFAULT_TIME_FIELD) or DEFAULT_TIME_FIELD
+
+    # Resolve field to keyword if possible
+    target_field = ensure_terms_field(field, inventory) or field
+
+    body = {
+        "size": 0,
+        "query": {
+            "bool": {
+                "filter": build_time_filters(lookback, time_field)
+            }
+        },
+        "aggs": {
+            "top_values": {
+                "terms": {
+                    "field": target_field,
+                    "size": size,
+                    "missing": "UNKNOWN"
+                }
+            }
+        },
+        "timeout": f"{SEARCH_TIMEOUT_MS}ms",
+    }
+
+    try:
+        response = client.search(index=indices, body=body)
+    except es_exceptions.ElasticsearchException as exc:
+        return {"error": f"Failed to get top values: {exc}"}
+
+    buckets = response.get("aggregations", {}).get("top_values", {}).get("buckets", [])
+    values = parse_terms_buckets(buckets)
+
+    return {
+        "field": target_field,
+        "time_window": {"gte": lookback, "lte": "now"},
+        "top_values": values,
+    }
+
+
 if ENABLE_PLANNER:
     @server.tool()
     def plan_query(
@@ -2311,6 +2409,11 @@ def log_startup() -> None:
         "search_paginated",
         "estimate_response_size",
         "sample_logs_stratified",
+        "get_cluster_health",
+        "find_traces_by_user",
+        "analyze_error_patterns",
+        "get_metric_statistics",
+        "get_top_values",
     ]
     if ENABLE_PLANNER:
         tools_enabled.append("plan_query")

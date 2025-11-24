@@ -10,5 +10,6 @@ dependencies = [
     "openai",
     "langchain-openai",
     "pydantic",
-    "python-dotenv"
+    "python-dotenv",
+    "faker"
 ]
